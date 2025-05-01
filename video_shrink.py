@@ -36,33 +36,72 @@ def probe_video(file_path):
         print(f"Probe error: {e}")
         return None, 0, 0
 
-def get_scale_filter(width, height, target_width, target_height):
+def get_scale_filter(width, height, target_width, target_height, use_vaapi=False):
     if target_width >= width and target_height >= height:
         return None
     aspect = width / height
-    new_width = min(target_width, width)
-    new_height = int(new_width / aspect)
-    if new_height > target_height:
-        new_height = target_height
-        new_width = int(new_height * aspect)
+    new_width = target_width
+    new_height = target_height
+    # Preserve aspect ratio if needed
+    if abs((new_width / new_height) - aspect) > 0.01:
+        new_width = min(target_width, int(target_height * aspect))
+        new_height = min(target_height, int(new_width / aspect))
     new_width -= new_width % 2
     new_height -= new_height % 2
+    if use_vaapi:
+        return f"scale={new_width}:{new_height},format=nv12,hwupload=extra_hw_frames=16"
     return f"scale={new_width}:{new_height}"
+
+def check_vaapi_support():
+    """Check if FFmpeg supports h264_vaapi codec."""
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-encoders"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        return "h264_vaapi" in result.stdout
+    except Exception as e:
+        print(f"VAAPI check error: {e}")
+        return False
 
 def encode_video(input_path, output_path, bitrate, duration, output_ext, scale_filter=None):
     print(f"Encoding: {input_path} -> {output_path} at {bitrate:.0f} kbps")
-    ffmpeg_path = "/usr/bin/ffmpeg"
+    ffmpeg_path = "ffmpeg"
+    
+    use_vaapi = check_vaapi_support()
+    codec = "h264_vaapi" if use_vaapi else "libx264"
+    
+    if not use_vaapi:
+        print("VAAPI not supported. Continue with CPU-only encoding (libx264)? [y/n]")
+        response = input().strip().lower()
+        if response != 'y':
+            print("Exiting...")
+            exit(1)
+    
+    print(f"Using {'GPU (h264_vaapi)' if use_vaapi else 'CPU (libx264)'} for video encoding. CPU used for audio and filtering.")
+    
     try:
-        cmd = [
-            ffmpeg_path, "-y", "-i", input_path,
-            "-c:v", "libx264", "-b:v", f"{int(bitrate)}k",
-            "-c:a", "aac", "-b:a", "128k",
-            "-preset", "veryfast", "-threads", "4",
-            "-progress", "pipe:2", "-loglevel", "info",
-            output_path
-        ]
+        cmd = [ffmpeg_path, "-y"]
+        if use_vaapi:
+            cmd.extend(["-vaapi_device", "/dev/dri/renderD128"])
+        cmd.extend(["-i", input_path])
+        
         if scale_filter:
             cmd.extend(["-vf", scale_filter])
+        
+        cmd.extend([
+            "-c:v", codec, "-b:v", f"{int(bitrate)}k",
+            "-c:a", "aac", "-b:a", "128k"
+        ])
+        
+        if use_vaapi:
+            cmd.extend(["-rc_mode", "VBR"])
+        else:
+            cmd.extend(["-preset", "veryfast", "-threads", "4"])
+        
+        cmd.extend(["-progress", "pipe:2", "-loglevel", "info", output_path])
 
         with open("ffmpeg_log.txt", "a") as log:
             log.write(f"Command: {' '.join(cmd)}\n")
@@ -92,11 +131,68 @@ def encode_video(input_path, output_path, bitrate, duration, output_ext, scale_f
                         progress_bar.refresh()
             finally:
                 progress_bar.close()
-                stdout, stderr = process.communicate(timeout=TIMEOUT_SECONDS)
-                log.write(f"Stdout: {stdout}\nStderr: {stderr}\n")
+            
+            stdout, stderr = process.communicate(timeout=TIMEOUT_SECONDS)
+            log.write(f"Stdout: {stdout}\nStderr: {stderr}\n")
 
             if process.returncode != 0:
                 print(f"FFmpeg error (code {process.returncode}): {''.join(stderr_lines[-10:])}")
+                if use_vaapi:
+                    print("VAAPI encoding failed. Retry with CPU-only encoding (libx264)? [y/n]")
+                    response = input().strip().lower()
+                    if response == 'y':
+                        # Retry with libx264
+                        cmd = [ffmpeg_path, "-y", "-i", input_path]
+                        if scale_filter:
+                            # Use CPU scaling for libx264
+                            cpu_scale_filter = scale_filter.replace(",format=nv12,hwupload=extra_hw_frames=16", "")
+                            cmd.extend(["-vf", cpu_scale_filter])
+                        cmd.extend([
+                            "-c:v", "libx264", "-b:v", f"{int(bitrate)}k",
+                            "-c:a", "aac", "-b:a", "128k",
+                            "-preset", "veryfast", "-threads", "4",
+                            "-progress", "pipe:2", "-loglevel", "info", output_path
+                        ])
+                        log.write(f"Retry Command: {' '.join(cmd)}\n")
+                        print(f"Retry Command: {' '.join(cmd)}")
+                        process = subprocess.Popen(
+                            cmd,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            text=True,
+                            env=os.environ
+                        )
+                        stderr_lines = []
+                        progress_bar = tqdm(total=duration, desc="Encoding (CPU)", unit="s")
+                        try:
+                            while True:
+                                line = process.stderr.readline()
+                                if not line and process.poll() is not None:
+                                    break
+                                stderr_lines.append(line)
+                                log.write(line)
+                                match = time_regex.search(line)
+                                if match:
+                                    current_time = int(match.group(1)) / 1_000_000
+                                    progress_bar.n = min(current_time, duration)
+                                    progress_bar.refresh()
+                        finally:
+                            progress_bar.close()
+                        
+                        stdout, stderr = process.communicate(timeout=TIMEOUT_SECONDS)
+                        log.write(f"Stdout: {stdout}\nStderr: {stderr}\n")
+
+                        if process.returncode != 0:
+                            print(f"CPU encoding error (code {process.returncode}): {''.join(stderr_lines[-10:])}")
+                            return False
+
+                        if not os.path.exists(output_path):
+                            print(f"Error: Output '{output_path}' not created")
+                            return False
+                        return True
+                    else:
+                        print("Exiting...")
+                        return False
                 return False
 
         if not os.path.exists(output_path):
@@ -107,6 +203,61 @@ def encode_video(input_path, output_path, bitrate, duration, output_ext, scale_f
         print(f"Encode error: {e}")
         with open("ffmpeg_log.txt", "a") as log:
             log.write(f"Error: {e}\n")
+        if use_vaapi:
+            print("VAAPI encoding failed. Retry with CPU-only encoding (libx264)? [y/n]")
+            response = input().strip().lower()
+            if response == 'y':
+                # Retry with libx264
+                cmd = [ffmpeg_path, "-y", "-i", input_path]
+                if scale_filter:
+                    cpu_scale_filter = scale_filter.replace(",format=nv12,hwupload=extra_hw_frames=16", "")
+                    cmd.extend(["-vf", cpu_scale_filter])
+                cmd.extend([
+                    "-c:v", "libx264", "-b:v", f"{int(bitrate)}k",
+                    "-c:a", "aac", "-b:a", "128k",
+                    "-preset", "veryfast", "-threads", "4",
+                    "-progress", "pipe:2", "-loglevel", "info", output_path
+                ])
+                log.write(f"Retry Command: {' '.join(cmd)}\n")
+                print(f"Retry Command: {' '.join(cmd)}")
+                process = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    env=os.environ
+                )
+                stderr_lines = []
+                progress_bar = tqdm(total=duration, desc="Encoding (CPU)", unit="s")
+                try:
+                    while True:
+                        line = process.stderr.readline()
+                        if not line and process.poll() is not None:
+                            break
+                        stderr_lines.append(line)
+                        log.write(line)
+                        match = time_regex.search(line)
+                        if match:
+                            current_time = int(match.group(1)) / 1_000_000
+                            progress_bar.n = min(current_time, duration)
+                            progress_bar.refresh()
+                finally:
+                    progress_bar.close()
+                
+                stdout, stderr = process.communicate(timeout=TIMEOUT_SECONDS)
+                log.write(f"Stdout: {stdout}\nStderr: {stderr}\n")
+
+                if process.returncode != 0:
+                    print(f"CPU encoding error (code {process.returncode}): {''.join(stderr_lines[-10:])}")
+                    return False
+
+                if not os.path.exists(output_path):
+                    print(f"Error: Output '{output_path}' not created")
+                    return False
+                return True
+            else:
+                print("Exiting...")
+                return False
         return False
 
 def resize_video(input_path, size_mb, resolution=None, bitrate=None, format="mp4"):
@@ -136,7 +287,7 @@ def resize_video(input_path, size_mb, resolution=None, bitrate=None, format="mp4
 
     target_width, target_height = RESOLUTIONS[resolution] if resolution in RESOLUTIONS else (width, height)
     print(f"Resolution: {target_width}x{target_height}")
-    scale_filter = get_scale_filter(width, height, target_width, target_height)
+    scale_filter = get_scale_filter(width, height, target_width, target_height, check_vaapi_support())
 
     if bitrate:
         success = encode_video(input_path, output_path, bitrate, duration, output_ext, scale_filter)
@@ -188,27 +339,35 @@ def resize_video(input_path, size_mb, resolution=None, bitrate=None, format="mp4
         return None
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--downscale", choices=RESOLUTIONS.keys())
-    parser.add_argument("--bitrate", type=float)
-    parser.add_argument("--size", default=f"{DEFAULT_SIZE_MB}MB")
-    parser.add_argument("--format", default="mp4", choices=FORMATS.values())
-    args = parser.parse_args()
+    try:
+        print("Starting script...")
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--downscale", choices=RESOLUTIONS.keys())
+        parser.add_argument("--bitrate", type=float)
+        parser.add_argument("--size", default=f"{DEFAULT_SIZE_MB}MB")
+        parser.add_argument("--format", default="mp4", choices=FORMATS.values())
+        args = parser.parse_args()
 
-    size_mb = parse_size(args.size)
-    input_path = None
-    for ext in FORMATS.values():
-        path = os.path.abspath(f"input_video.{ext}")
-        if os.path.isfile(path):
-            input_path = path
-            print(f"Found: {input_path}")
-            break
-    if not input_path:
-        print("Error: No input_video found")
-        return
+        size_mb = parse_size(args.size)
+        input_path = None
+        for ext in FORMATS.values():
+            path = os.path.abspath(f"input_video.{ext}")
+            if os.path.isfile(path):
+                input_path = path
+                print(f"Found: {input_path}")
+                break
+        if not input_path:
+            print("Error: No input_video found")
+            with open("ffmpeg_log.txt", "a") as log:
+                log.write("Error: No input_video found\n")
+            return
 
-    output = resize_video(input_path, size_mb, args.downscale, args.bitrate, args.format)
-    print("Conversion " + ("complete: " + output if output else "failed"))
+        output = resize_video(input_path, size_mb, args.downscale, args.bitrate, args.format)
+        print("Conversion " + ("complete: " + output if output else "failed"))
+    except Exception as e:
+        print(f"Main error: {e}")
+        with open("ffmpeg_log.txt", "a") as log:
+            log.write(f"Main error: {e}\n")
 
 if __name__ == "__main__":
     main()
