@@ -7,8 +7,9 @@ def shrink_image(image_path, size=(32, 32)):
         img.save(image_path)
 
 if __name__ == "__main__":
-    folder = "/home/monk/test/"
-    size = (32, 32)  # define size here
+    folder  = "/home/monk/Repos/pctoolbelt/"
+    size    = (64, 117)  # define size here
+
     for image in os.listdir(folder):
         if image.lower().endswith(('.png', '.jpg', '.jpeg')):
             path = os.path.join(folder, image)
